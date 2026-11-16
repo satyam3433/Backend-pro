@@ -2,12 +2,35 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { randomUUID } = require("node:crypto");
 const bcrypt = require("bcryptjs");
+const { createClient } = require("@supabase/supabase-js");
 
 const DATA_DIR = process.env.DINESYNC_DATA_DIR
   ? path.resolve(process.env.DINESYNC_DATA_DIR)
   : path.resolve(__dirname, "..", "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || "";
+const STATE_TABLE = "dinesync_state";
+const DATABASE_VERSION = Symbol("databaseVersion");
 let localUpdateQueue = Promise.resolve();
+
+if (Boolean(SUPABASE_URL) !== Boolean(SUPABASE_SECRET_KEY)) {
+  throw new Error("Configure both SUPABASE_URL and SUPABASE_SECRET_KEY, or leave both unset for local JSON storage.");
+}
+
+const supabase = SUPABASE_URL
+  ? createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
+  })
+  : null;
+
+class DatabaseConflictError extends Error {
+  constructor() {
+    super("The data changed during this request. Please retry.");
+    this.name = "DatabaseConflictError";
+    this.statusCode = 409;
+  }
+}
 
 function seedDatabase() {
   const now = new Date().toISOString();
@@ -61,16 +84,64 @@ function seedDatabase() {
 }
 
 async function readDatabase() {
+  if (supabase) {
+    const { data: row, error } = await supabase
+      .from(STATE_TABLE)
+      .select("data,version")
+      .eq("id", 1)
+      .maybeSingle();
+    if (error) throw new Error(`Could not read the Supabase database: ${error.message}`);
+    if (!row) throw new Error("The Supabase database is not initialized. Follow the SQL setup in README.md.");
+    Object.defineProperty(row.data, DATABASE_VERSION, {
+      value: Number(row.version),
+      configurable: true,
+      writable: true
+    });
+    return row.data;
+  }
   return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
 }
 
 async function writeDatabase(database) {
+  if (supabase) {
+    const version = database[DATABASE_VERSION];
+    if (version === undefined) throw new Error("Cannot update a database state without its version.");
+    const { data: row, error } = await supabase
+      .from(STATE_TABLE)
+      .update({ data: JSON.parse(JSON.stringify(database)), version: version + 1 })
+      .eq("id", 1)
+      .eq("version", version)
+      .select("version")
+      .maybeSingle();
+    if (error) throw new Error(`Could not write the Supabase database: ${error.message}`);
+    if (!row) throw new DatabaseConflictError();
+    Object.defineProperty(database, DATABASE_VERSION, {
+      value: Number(row.version),
+      configurable: true,
+      writable: true
+    });
+    return;
+  }
   const temporaryFile = `${DB_FILE}.tmp`;
   fs.writeFileSync(temporaryFile, `${JSON.stringify(database, null, 2)}\n`);
   fs.renameSync(temporaryFile, DB_FILE);
 }
 
 async function updateDatabase(update) {
+  if (supabase) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const database = await readDatabase();
+      const result = await update(database);
+      try {
+        await writeDatabase(database);
+        return result;
+      } catch (error) {
+        if (!(error instanceof DatabaseConflictError) || attempt === 4) throw error;
+      }
+    }
+    throw new DatabaseConflictError();
+  }
+
   const operation = localUpdateQueue.then(async () => {
     const database = await readDatabase();
     const result = await update(database);
@@ -82,16 +153,37 @@ async function updateDatabase(update) {
 }
 
 async function initializeDatabase() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (process.env.NODE_ENV === "production" && !supabase) {
+    throw new Error("Set SUPABASE_URL and SUPABASE_SECRET_KEY in production; local JSON storage is for development only.");
+  }
   let database;
-  if (!fs.existsSync(DB_FILE)) {
-    database = seedDatabase();
-    await writeDatabase(database);
+  if (supabase) {
+    const { data: existing, error: lookupError } = await supabase
+      .from(STATE_TABLE)
+      .select("id")
+      .eq("id", 1)
+      .maybeSingle();
+    if (lookupError) {
+      throw new Error(`Could not access Supabase table "${STATE_TABLE}". Create it using the SQL in README.md: ${lookupError.message}`);
+    }
+    if (!existing) {
+      const { error } = await supabase
+        .from(STATE_TABLE)
+        .upsert({ id: 1, version: 0, data: seedDatabase() }, { onConflict: "id", ignoreDuplicates: true });
+      if (error) throw new Error(`Could not initialize Supabase table "${STATE_TABLE}": ${error.message}`);
+    }
+    database = await readDatabase();
   } else {
-    database = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(DB_FILE)) {
+      database = seedDatabase();
+      await writeDatabase(database);
+    } else {
+      database = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
+    }
   }
   if (!database || !Array.isArray(database.tables) || !Array.isArray(database.orders)) {
-    throw new Error(`Invalid database file at ${DB_FILE}. Restore a valid JSON export before starting DineSync.`);
+    throw new Error(`Invalid database state${supabase ? "" : ` at ${DB_FILE}`}. Restore a valid backup before starting DineSync.`);
   }
 
   const bootstrapAccounts = [

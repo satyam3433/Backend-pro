@@ -404,7 +404,7 @@ if (require.main === module) {
   initializeDatabase().then(() => {
     app.listen(PORT, () => {
       console.log(`DineSync API is running at http://localhost:${PORT}`);
-      console.log(`Database: ${process.env.DATABASE_URL || process.env.POSTGRES_URL ? "managed PostgreSQL" : DB_FILE}`);
+      console.log(`Database: ${process.env.SUPABASE_URL ? "Supabase" : DB_FILE}`);
     });
   }).catch(error => {
     console.error("DineSync failed to initialize:", error.message);

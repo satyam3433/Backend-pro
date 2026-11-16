@@ -246,3 +246,22 @@ test("production refuses local demo authentication", () => {
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /DINESYNC_DEMO_AUTH cannot be enabled in production/);
 });
+
+test("production requires Supabase storage configuration", () => {
+  const result = spawnSync(process.execPath, [
+    "-e",
+    "require('./backend/store').initializeDatabase().catch(error => { console.error(error.message); process.exitCode = 1; })"
+  ], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      NODE_ENV: "production",
+      DINESYNC_DEMO_AUTH: "false",
+      SUPABASE_URL: "",
+      SUPABASE_SECRET_KEY: ""
+    },
+    encoding: "utf8"
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Set SUPABASE_URL and SUPABASE_SECRET_KEY in production/);
+});
